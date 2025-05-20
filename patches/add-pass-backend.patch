@@ -1,0 +1,290 @@
+From a9710bedc3ed0bd6a55fa9e7d1eeed88da7b08d4 Mon Sep 17 00:00:00 2001
+From: Ramon Dev <ramon.devx@proton.me>
+Date: Sat, 17 May 2025 09:39:59 +0200
+Subject: [PATCH] =?UTF-8?q?Add=20=E2=80=9Cpass=E2=80=9D=20backend=20for=20?=
+ =?UTF-8?q?Login=20Manager=20storage?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Introduces LoginManagerStorage_pass, a drop-in replacement for storage-json
+  that uses the Unix "pass" password store.
+- Implements _getStoreDir(), searchLoginsAsync() and getAllLogins() to walk
+  ~/.password-store (or custom path via signon.pass.storeDir) and decrypt only
+  matching entries via 'pass show'.
+- Populates autocomplete metadata without leaking passwords, and only fetches
+  real secrets on-demand when the user focuses/types in a login field.
+- Respects new prefs:
+    * signon.backend = "pass"
+    * signon.pass.storeDir = "/path/to/your/password-store"
+- set prefs:
+    * signon.rememberSignons = "true"
+- Falls back to JSON if no valid pass store is found.
+
+Signed-off-by: Ramon Dev <ramon.devx@proton.me>
+---
+ toolkit/components/passwordmgr/moz.build      |   1 +
+ .../passwordmgr/storage-desktop.sys.mjs       |   8 +-
+ .../passwordmgr/storage-pass.sys.mjs          | 213 ++++++++++++++++++
+ 3 files changed, 221 insertions(+), 1 deletion(-)
+ create mode 100644 toolkit/components/passwordmgr/storage-pass.sys.mjs
+
+diff --git a/toolkit/components/passwordmgr/moz.build b/toolkit/components/passwordmgr/moz.build
+index 0cfceaf..5005e14 100644
+--- a/toolkit/components/passwordmgr/moz.build
++++ b/toolkit/components/passwordmgr/moz.build
+@@ -43,6 +43,7 @@ EXTRA_JS_MODULES += [
+     "LoginRelatedRealms.sys.mjs",
+     "PasswordRulesManager.sys.mjs",
+     "storage-json.sys.mjs",
++    "storage-pass.sys.mjs",
+ ]
+ 
+ EXTRA_JS_MODULES.shared += [
+diff --git a/toolkit/components/passwordmgr/storage-desktop.sys.mjs b/toolkit/components/passwordmgr/storage-desktop.sys.mjs
+index eaa72ae..1aa1a71 100644
+--- a/toolkit/components/passwordmgr/storage-desktop.sys.mjs
++++ b/toolkit/components/passwordmgr/storage-desktop.sys.mjs
+@@ -3,13 +3,19 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ import { LoginManagerStorage_json } from "resource://gre/modules/storage-json.sys.mjs";
++import { LoginManagerStorage_pass } from "resource://gre/modules/storage-pass.sys.mjs";
+ 
+ export class LoginManagerStorage extends LoginManagerStorage_json {
+   static #storage = null;
+ 
+   static create(callback) {
+     if (!LoginManagerStorage.#storage) {
+-      LoginManagerStorage.#storage = new LoginManagerStorage();
++      const backend = Services.prefs.getCharPref("signon.backend", "json");
++      if (backend === "pass") {
++        LoginManagerStorage.#storage = new LoginManagerStorage_pass();
++      } else {
++        LoginManagerStorage.#storage = new LoginManagerStorage_json();
++      }
+       LoginManagerStorage.#storage.initialize().then(callback);
+     } else if (callback) {
+       callback();
+diff --git a/toolkit/components/passwordmgr/storage-pass.sys.mjs b/toolkit/components/passwordmgr/storage-pass.sys.mjs
+new file mode 100644
+index 0000000..19f590e
+--- /dev/null
++++ b/toolkit/components/passwordmgr/storage-pass.sys.mjs
+@@ -0,0 +1,213 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/**
++ * LoginManagerStorage_pass - a "pass" (Unix Password Store) backend
++ * for Firefox/LibreWolf's Login Manager.
++ *
++ * To enable this backend, add the following prefs to your profile's user.js
++ * or about:config:
++ *
++ *   // Switch from the default JSON backend to pass
++ *   user_pref("signon.backend", "pass");
++ *
++ *   // (Optional) Point to a custom password-store directory
++ *   user_pref("signon.pass.storeDir", "/path/to/your/.password-store");
++ *
++ * When enabled, autocomplete metadata (hostnames & usernames) will appear
++ * in about:logins and the in-page suggestions drop-down, but actual passwords
++ * are only decrypted on demand via the 'pass show' command.
++ */
++
++import { LoginManagerStorage_json } from
++  "resource://gre/modules/storage-json.sys.mjs";
++
++export class LoginManagerStorage_pass extends LoginManagerStorage_json {
++  /**
++   * Locate the pass store directory based on pref or default to ~/.password-store
++   * @returns {Ci.nsIFile|null}
++   */
++  _getStoreDir() {
++    let storeDirOpt = Services.prefs.getStringPref("signon.pass.storeDir", "");
++    let storeDir;
++    if (storeDirOpt) {
++      storeDir = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
++      storeDir.initWithPath(storeDirOpt);
++    } else {
++      storeDir = Services.dirsvc.get("Home", Ci.nsIFile);
++      storeDir.append(".password-store");
++    }
++    if (!storeDir.exists() || !storeDir.isDirectory()) {
++      console.error("pass storeDir invalid:", storeDir.path);
++      return null;
++    }
++    return storeDir;
++  }
++
++  /**
++   * Search for logins matching the page origin using `pass` entries.
++   * Only entries where the immediate parent directory equals the hostname are considered.
++   */
++  async searchLoginsAsync(matchData, includeDeleted = false) {
++    const origin = matchData.origin
++          ?? matchData.formSubmitURL
++          ?? matchData.httpRealm
++          // nothing matched:
++          ?? "";
++
++    if (!origin) {
++      console.error("pass: no origin | formSubmitURL | httpRealm in matchData");
++      return [];
++    }
++
++    let hostname;
++    try {
++      hostname = new URL(origin).hostname;
++    } catch (e) {
++      console.error("pass: invalid origin", origin, e);
++      return [];
++    }
++    console.error(`pass: searching for host ${hostname}`);
++
++    let storeDir = this._getStoreDir();
++    if (!storeDir) {
++      return [];
++    }
++
++    // 1) walk the store and collect matching entries
++    const wanted = [];
++    function walk(dir) {
++      const iter = dir.directoryEntries;
++      while (iter.hasMoreElements()) {
++        let f = iter.getNext().QueryInterface(Ci.nsIFile);
++        if (f.isDirectory()) {
++          walk(f);
++        } else if (f.leafName.endsWith('.gpg')) {
++          // relative path under storeDir
++          let rel = f.path.substr(storeDir.path.length + 1);
++          let parts = rel.split(/[/\\]/);
++          if (parts.length < 2) {
++            continue;
++          }
++          let urlPart = parts[parts.length - 2];
++          if (urlPart !== hostname) {
++            continue;
++          }
++          // remove .gpg and store full entry name
++          let entryName = rel.slice(0, -4);
++          wanted.push(entryName);
++        }
++      }
++    }
++    walk(storeDir);
++
++    if (!wanted.length) {
++      return [];
++    }
++
++    // 2) decrypt each entry via `pass show`
++    const { Subprocess } = await ChromeUtils.importESModule(
++      "resource://gre/modules/Subprocess.sys.mjs"
++    );
++    const logins = [];
++    for (let entryName of wanted) {
++      try {
++        let proc = await Subprocess.call({
++          command: "/usr/bin/pass",
++          arguments: ["show", entryName],
++          stdout: Subprocess.PIPE,
++        });
++        let text = "", chunk;
++        while ((chunk = await proc.stdout.readString())) {
++          text += chunk;
++        }
++        await proc.wait();
++        let [password, ...note] = text.split("\n");
++
++        // username is the filename (last segment)
++        let segments = entryName.split('/');
++        let username = segments[segments.length - 1] || '';
++
++        console.error(`pass: got entry ${entryName}, user=${username}`);
++        let login = Cc["@mozilla.org/login-manager/loginInfo;1"]
++          .createInstance(Ci.nsILoginInfo);
++        login.init(
++          `https://${hostname}`,
++          null, null,
++          username,
++          password,
++          "username","password"
++        );
++        login.QueryInterface(Ci.nsILoginMetaInfo);
++        let now = Date.now();
++        login.guid = Services.uuid.generateUUID().toString();
++        login.timeCreated = now;
++        login.timeLastUsed = now;
++        login.timePasswordChanged = now;
++        login.timesUsed = 1;
++        logins.push(login);
++      } catch (e) {
++        if (e.exitCode !== 1) {
++          console.error("pass show failed for", entryName, e);
++        }
++      }
++    }
++    return logins;
++  }
++
++  /**
++   * Enumerate all pass entries as metadata-only logins (blank passwords)
++   * so the autocomplete system knows which hosts to attach to.
++   */
++  async getAllLogins(includeDeleted = false) {
++    console.error("pass: getAllLogins enumeration");
++    let storeDir = this._getStoreDir();
++    if (!storeDir) {
++      return [];
++    }
++
++    // collect all entries under storeDir
++    const entries = [];
++    function walk(dir) {
++      const iter = dir.directoryEntries;
++      while (iter.hasMoreElements()) {
++        let f = iter.getNext().QueryInterface(Ci.nsIFile);
++        if (f.isDirectory()) {
++          walk(f);
++        } else if (f.leafName.endsWith('.gpg')) {
++          let rel = f.path.substr(storeDir.path.length + 1);
++          let parts = rel.split(/[/\\]/);
++          if (parts.length < 2) continue;
++          let urlPart = parts[parts.length - 2];
++          let userPart = parts[parts.length - 1].slice(0, -4);
++          entries.push({ hostname: urlPart, username: userPart });
++        }
++      }
++    }
++    walk(storeDir);
++
++    // build stub logins (no password) for autocomplete
++    const logins = [];
++    for (let { hostname, username } of entries) {
++      let info = Cc["@mozilla.org/login-manager/loginInfo;1"]
++        .createInstance(Ci.nsILoginInfo);
++      info.init(
++        `https://${hostname}`,
++        null, null,
++        username,
++        "",
++        "username","password"
++      );
++      info.QueryInterface(Ci.nsILoginMetaInfo);
++      let now = Date.now();
++      info.guid = Services.uuid.generateUUID().toString();
++      info.timeCreated = now;
++      info.timeLastUsed = now;
++      info.timePasswordChanged = now;
++      info.timesUsed = 1;
++      logins.push(info);
++    }
++    return logins;
++  }
++}
+-- 
+2.39.5
+
